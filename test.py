@@ -1,0 +1,336 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# -------------------------------------------------------------
+# Configuration Parameters
+# -------------------------------------------------------------
+DATA_DIR = "data"
+INITIAL_CAPITAL = 10_000_000.0  # ₹1 Crore starting corpus
+TRANSACTION_FEE_RATE = 0.001  # 0.1% transaction friction per trade
+MAX_STOCKS = 10  # Maximum 10 stocks in portfolio
+MAX_SECTOR = 2  # Maximum 2 stocks from the same industry
+CORR_LIMIT = 0.65  # Upper bound for pairwise rolling correlation
+
+# -------------------------------------------------------------
+# 1. Load Local Cached Data
+# -------------------------------------------------------------
+adj_close = pd.read_csv(
+    os.path.join(DATA_DIR, "adjusted_close.csv"),
+    index_col=0,
+    parse_dates=True,
+)
+sector_map = pd.read_csv(os.path.join(DATA_DIR, "sector_map.csv"), index_col=0)[
+    "Sector"
+].to_dict()
+
+# Define Out-of-Sample Testing Period: Jan 2026 to June 2026
+TEST_START = "2026-01-01"
+TEST_END = "2026-06-30"
+
+backtest_dates = adj_close.loc[TEST_START:TEST_END].index
+all_dates = adj_close.index
+
+# Schedule monthly rebalancing for the test window
+rebalance_dates_raw = (
+    adj_close.loc[TEST_START:TEST_END].resample("MS").first().index
+)
+rebalance_dates = [
+    adj_close.loc[d:].index[0]
+    for d in rebalance_dates_raw
+    if len(adj_close.loc[d:]) > 0
+]
+
+# Portfolio state trackers
+cash = INITIAL_CAPITAL
+current_holdings = {}
+portfolio_history = []
+trades_log = []
+positions_tracker = {}
+closed_trades = []
+monthly_holdings_log = []
+
+print("Running Out-of-Sample Strategy Evaluation (Jan 2026 - June 2026)...")
+
+# -------------------------------------------------------------
+# 2. Main Simulation Loop
+# -------------------------------------------------------------
+for t in backtest_dates:
+  t_idx = all_dates.get_loc(t)
+  prices_today = adj_close.iloc[t_idx]
+
+  # Check if today is a scheduled Monthly Rebalance Date
+  if t in rebalance_dates:
+    lookback_slice = adj_close.iloc[max(0, t_idx - 250) : t_idx]
+
+    if len(lookback_slice) >= 200:
+      p_t = lookback_slice.iloc[-1]
+      p_t21 = lookback_slice.iloc[-21]
+      p_t_start = lookback_slice.iloc[0]
+
+      # Step A: Compute Factors
+      # 1. 12-Minus-1 Month Price Momentum
+      momentum = (p_t21 / p_t_start) - 1.0
+
+      # 2. Realized Volatility & Stability
+      daily_returns = lookback_slice.pct_change()
+      valid_counts = daily_returns.count()
+      volatility = daily_returns.std() * np.sqrt(252)
+      stability = 1.0 / (volatility + 1e-6)
+
+      # Step B: Filter by Trend (200-day Simple Moving Average)
+      sma_200 = lookback_slice.tail(200).mean()
+      trend_passed = p_t > sma_200
+
+      # Step C: Select Valid Stock Candidates
+      valid = (
+          (valid_counts >= 180)
+          & trend_passed
+          & momentum.notna()
+          & volatility.notna()
+          & (volatility > 0.05)
+          & (volatility < 1.0)
+          & p_t.notna()
+      )
+      candidate_pool = valid[valid].index.tolist()
+
+      if len(candidate_pool) >= 5:
+        # Standardize scores cross-sectionally
+        z_mom = (
+            momentum[candidate_pool] - momentum[candidate_pool].mean()
+        ) / (momentum[candidate_pool].std() + 1e-6)
+        z_stab = (
+            stability[candidate_pool] - stability[candidate_pool].mean()
+        ) / (stability[candidate_pool].std() + 1e-6)
+        composite_score = (0.60 * z_mom + 0.40 * z_stab).sort_values(
+            ascending=False
+        )
+
+        # Step D: Correlation & Sector-Constrained Selection
+        recent_returns = daily_returns.tail(60)
+        selected_stocks = []
+        sector_counts = {}
+
+        for sym in composite_score.index:
+          if len(selected_stocks) >= MAX_STOCKS:
+            break
+          sec = sector_map.get(sym, "General")
+          if sector_counts.get(sec, 0) >= MAX_SECTOR:
+            continue
+          if selected_stocks:
+            corrs = [
+                recent_returns[sym].corr(recent_returns[existing])
+                for existing in selected_stocks
+                if existing in recent_returns
+            ]
+            corrs = [c for c in corrs if not np.isnan(c)]
+            if corrs and max(corrs) > CORR_LIMIT:
+              continue
+          selected_stocks.append(sym)
+          sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+        # Step E: Portfolio Weighting (Inverse-Volatility Sizing)
+        if selected_stocks:
+          inv_vol = 1.0 / volatility[selected_stocks]
+          target_weights = (inv_vol / inv_vol.sum()).to_dict()
+        else:
+          target_weights = {}
+      else:
+        target_weights = {}
+
+      # Record monthly portfolio target allocations
+      for sym, weight in target_weights.items():
+        monthly_holdings_log.append({
+            "Date": t.strftime("%Y-%m-%d"),
+            "Ticker": sym,
+            "Target_Weight": weight,
+        })
+
+      # Execute Liquidations (Sell stocks no longer selected)
+      for sym in list(current_holdings.keys()):
+        if sym not in target_weights:
+          sell_price = prices_today[sym]
+          sell_proceeds = current_holdings[sym] * sell_price
+          fee = sell_proceeds * TRANSACTION_FEE_RATE
+          cash += sell_proceeds - fee
+          trades_log.append({
+              "Date": t.strftime("%Y-%m-%d"),
+              "Ticker": sym,
+              "Action": "SELL",
+              "Shares": current_holdings[sym],
+              "Price": sell_price,
+              "Trade_Value": sell_proceeds,
+              "Fee": fee,
+          })
+
+          if sym in positions_tracker:
+            cost = positions_tracker[sym]["cost"]
+            pnl = (sell_proceeds - fee) - cost
+            closed_trades.append({"Ticker": sym, "PnL": pnl})
+            del positions_tracker[sym]
+          del current_holdings[sym]
+
+      # Execute Target Rebalancing (Buy / Trim to match target weights)
+      total_portfolio_value = cash + sum(
+          current_holdings[s] * prices_today[s]
+          for s in current_holdings
+          if not np.isnan(prices_today[s])
+      )
+      for sym, weight in target_weights.items():
+        if np.isnan(prices_today[sym]) or prices_today[sym] <= 0:
+          continue
+        target_val = total_portfolio_value * weight
+        curr_val = current_holdings.get(sym, 0) * prices_today[sym]
+        diff = target_val - curr_val
+
+        if diff > 0:
+          fee = diff * TRANSACTION_FEE_RATE
+          if cash >= (diff + fee):
+            shares_to_buy = int(diff / prices_today[sym])
+            if shares_to_buy > 0:
+              cost = shares_to_buy * prices_today[sym]
+              fee = cost * TRANSACTION_FEE_RATE
+              cash -= cost + fee
+              current_holdings[sym] = (
+                  current_holdings.get(sym, 0) + shares_to_buy
+              )
+              trades_log.append({
+                  "Date": t.strftime("%Y-%m-%d"),
+                  "Ticker": sym,
+                  "Action": "BUY",
+                  "Shares": shares_to_buy,
+                  "Price": prices_today[sym],
+                  "Trade_Value": cost,
+                  "Fee": fee,
+              })
+              if sym not in positions_tracker:
+                positions_tracker[sym] = {"cost": cost + fee}
+              else:
+                positions_tracker[sym]["cost"] += cost + fee
+        elif diff < 0:
+          sell_val = abs(diff)
+          shares_to_sell = int(sell_val / prices_today[sym])
+          if shares_to_sell > 0:
+            proceeds = shares_to_sell * prices_today[sym]
+            fee = proceeds * TRANSACTION_FEE_RATE
+            cash += proceeds - fee
+            current_holdings[sym] -= shares_to_sell
+            trades_log.append({
+                "Date": t.strftime("%Y-%m-%d"),
+                "Ticker": sym,
+                "Action": "TRIM",
+                "Shares": shares_to_sell,
+                "Price": prices_today[sym],
+                "Trade_Value": proceeds,
+                "Fee": fee,
+            })
+
+  # Record Daily Portfolio Valuation
+  holdings_value = sum(
+      current_holdings[sym] * prices_today[sym]
+      for sym in current_holdings
+      if not np.isnan(prices_today[sym])
+  )
+  daily_total = cash + holdings_value
+  portfolio_history.append({
+      "Date": t.strftime("%Y-%m-%d"),
+      "Portfolio_Value": daily_total,
+      "Cash": cash,
+      "Holdings_Value": holdings_value,
+  })
+
+# -------------------------------------------------------------
+# 3. Performance Metrics Calculation
+# -------------------------------------------------------------
+df_results = pd.DataFrame(portfolio_history).set_index("Date")
+df_results["Daily_Return"] = (
+    df_results["Portfolio_Value"].pct_change().fillna(0)
+)
+
+final_val = df_results["Portfolio_Value"].iloc[-1]
+net_pnl = final_val - INITIAL_CAPITAL
+total_return = (final_val / INITIAL_CAPITAL) - 1.0
+
+# Calculate exact time fraction for CAGR over test period
+days_elapsed = (
+    pd.to_datetime(df_results.index[-1]) - pd.to_datetime(df_results.index[0])
+).days
+years_elapsed = max(days_elapsed / 365.25, 1e-6)
+cagr = ((final_val / INITIAL_CAPITAL) ** (1.0 / years_elapsed)) - 1.0
+
+rolling_max = df_results["Portfolio_Value"].cummax()
+drawdown = (df_results["Portfolio_Value"] - rolling_max) / rolling_max
+mdd = drawdown.min()
+
+daily_std = df_results["Daily_Return"].std()
+sharpe = (df_results["Daily_Return"].mean() / daily_std) * np.sqrt(
+    252
+) if daily_std > 0 else 0
+annualized_vol = daily_std * np.sqrt(252)
+
+df_closed = pd.DataFrame(closed_trades)
+wins = df_closed[df_closed["PnL"] > 0] if not df_closed.empty else []
+losses = df_closed[df_closed["PnL"] <= 0] if not df_closed.empty else []
+accuracy = (len(wins) / len(df_closed)) * 100 if len(df_closed) > 0 else 0
+avg_win = wins["PnL"].mean() if len(wins) > 0 else 0
+avg_loss = abs(losses["PnL"].mean()) if len(losses) > 0 else 1
+gain_to_loss = avg_win / avg_loss
+
+df_trades = pd.DataFrame(trades_log)
+total_fees = df_trades["Fee"].sum() if not df_trades.empty else 0.0
+
+summary_metrics = [
+    ("Evaluation Period", f"{TEST_START} to {TEST_END}"),
+    ("Starting Capital", f"₹{INITIAL_CAPITAL:,.2f}"),
+    ("Final Portfolio Value", f"₹{final_val:,.2f}"),
+    ("Total Net PnL", f"₹{net_pnl:,.2f}"),
+    ("Absolute Return", f"{total_return * 100:.2f}%"),
+    ("Annualized Return (CAGR)", f"{cagr * 100:.2f}%"),
+    ("Maximum Drawdown (MDD)", f"{mdd * 100:.2f}%"),
+    ("Sharpe Ratio (Rf = 0%)", f"{sharpe:.2f}"),
+    ("Annualized Volatility", f"{annualized_vol * 100:.2f}%"),
+    ("Trade Accuracy (Win Rate)", f"{accuracy:.2f}%"),
+    ("Gain-to-Loss Ratio", f"{gain_to_loss:.2f}"),
+    ("Total Rebalance Trades", f"{len(df_trades)}"),
+    ("Total Friction Paid", f"₹{total_fees:,.2f}"),
+]
+df_summary = pd.DataFrame(summary_metrics, columns=["Metric", "Value"])
+
+print("\n" + "=" * 55)
+print("     OUT-OF-SAMPLE TEST SUMMARY (JAN 2026 - JUNE 2026)")
+print("=" * 55)
+print(df_summary.to_string(index=False))
+print("=" * 55)
+
+# -------------------------------------------------------------
+# 4. Save Testing Outputs & Plots
+# -------------------------------------------------------------
+df_summary.to_csv(
+    os.path.join(DATA_DIR, "test_performance_summary.csv"), index=False
+)
+df_results.to_csv(os.path.join(DATA_DIR, "test_backtest_curve.csv"))
+df_trades.to_csv(os.path.join(DATA_DIR, "test_trades_log.csv"), index=False)
+pd.DataFrame(monthly_holdings_log).to_csv(
+    os.path.join(DATA_DIR, "test_monthly_holdings.csv"), index=False
+)
+
+plt.figure(figsize=(12, 6))
+plt.plot(
+    pd.to_datetime(df_results.index),
+    df_results["Portfolio_Value"] / 10_000_000,
+    label="Strategy Test Portfolio (₹ Cr)",
+    color="#d9534f",
+    lw=2,
+)
+plt.title(
+    "Out-of-Sample Portfolio Growth (Jan 2026 - June 2026)",
+    fontsize=14,
+    fontweight="bold",
+)
+plt.xlabel("Date")
+plt.ylabel("Portfolio Value (in ₹ Crores)")
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(DATA_DIR, "test_equity_curve.png"), dpi=300)
