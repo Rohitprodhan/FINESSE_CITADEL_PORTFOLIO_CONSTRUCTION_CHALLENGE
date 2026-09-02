@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Set your exact project data directory
-OUTPUT_DIR = "/Users/mdsohelmondal/IITB_Portfolio_Challenge/data"
+# Save output beside this script in a local data folder
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "data")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -42,7 +43,7 @@ def fetch_universe_tickers():
     print(f"Total unique tickers extracted: {len(yf_tickers)}")
     return yf_tickers, sector_mapping
 
-def download_historical_data(tickers, start_date="2020-01-01", end_date="2026-01-01"):
+def download_historical_data(tickers, start_date="2020-01-01", end_date="2026-06-30"):
     print("Downloading historical data...")
     
     data = yf.download(

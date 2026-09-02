@@ -1,44 +1,3 @@
-"""
-backtest_v3.py
---------------
-Same strategy as backtest_v2.py (momentum/vol selection, SMA200 trend filter,
-sector cap, correlation screen, inverse-vol weighting, monthly rebalance,
-0.1% transaction cost) -- UNCHANGED. This version only fixes the trade-level
-P&L / win-rate / diagnostic accounting. See the chat explanation for the
-full list of what changed and why; short version:
-
-  BUG 1 FIXED: cost basis is now reduced proportionally (average-cost
-  accounting) whenever a position is trimmed, not just on full exit.
-
-  BUG 2 FIXED: every TRIM now realizes and records P&L, not just full SELLs.
-
-  BUG 3 FIXED: two separate statistic sets are now computed --
-    (A) REALIZED TRANSACTION stats: every individual TRIM/SELL is one
-        realized transaction.
-    (B) POSITION-LEVEL stats: one investment episode = first BUY through
-        the SELL that finally brings shares back to zero, aggregating every
-        TRIM/SELL P&L that happened along the way.
-
-  BUG 4 FIXED: positions_tracker now carries both "shares" and "cost_basis"
-  as the source of truth; current_holdings is kept (existing portfolio
-  logic depends on it) but an assertion checks the two never drift apart.
-
-  BUG 5 FIXED: an end-of-backtest reconciliation check verifies
-  initial_capital + realized_pnl + unrealized_pnl == final_portfolio_value,
-  and reports any discrepancy rather than hiding it.
-
-  BUG 6: average-cost accounting naturally handles BUY/TRIM/SELL in any
-  sequence -- no special-casing needed.
-
-Nothing about WHICH stocks are bought, WHEN, at WHAT price, WHAT quantity,
-or WHAT fee is touched. Portfolio value, CAGR, MDD, Sharpe, holdings,
-weights, rebalance dates, and transaction costs should be identical (up to
-floating-point rounding) to backtest_v2.py's output on the same data.
-
-Run:
-    python backtest_v3.py
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -48,7 +7,8 @@ import matplotlib.pyplot as plt
 # CONFIG -- unchanged from backtest_v2.py
 # -------------------------------------------------------------------------
 
-DATA_DIR = "data"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 INITIAL_CAPITAL = 1_00_00_000.0
 TRANSACTION_FEE_RATE = 0.001
 MAX_STOCKS = 10
@@ -60,7 +20,7 @@ SELECTION_VOL_WEIGHT = 0.0
 
 MOMENTUM_LOOKBACK = 250
 MOMENTUM_SKIP = 21
-SMA_WINDOW = 200
+SMA_WINDOW = 250
 CORR_WINDOW = 60
 
 MAIN_BACKTEST_START = "2021-01-01"
